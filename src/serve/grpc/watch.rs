@@ -152,18 +152,23 @@ fn apply_predicate(predicate: &u5c::watch::TxPredicate, tx: &u5c::cardano::Tx) -
     tx_matches && !not_clause && and_clause && or_clause
 }
 
-// Hydrates each input's `as_output` field using the pre-resolved inputs map
-// stored in the WAL LogValue for this block. This is a direct HashMap lookup —
-// no archive fetch, no block decode, no index query required.
+// Hydrates each input's `as_output` field, preferring the pre-resolved inputs
+// map stored in the WAL LogValue for this block and falling back to an archive
+// lookup when the WAL entry is missing (e.g. blocks past WAL retention).
 //
 // The WAL stores the full EraCbor for every UTxO consumed by a block at the
-// time it was applied, keyed by TxoRef(tx_hash, output_index). This is exactly
-// the data we need and is already available without any additional I/O.
+// time it was applied, keyed by TxoRef(tx_hash, output_index). When present,
+// this is a direct HashMap lookup. When absent, we resolve the source tx via
+// the tx-hash index and the archive. Per-tx caching avoids redundant archive
+// reads when a tx spends multiple outputs of the same source tx.
 fn fill_input_as_output<D: Domain + LedgerContext>(
     tx: &mut u5c::cardano::Tx,
     mapper: &interop::Mapper<D>,
+    domain: &D,
     wal_inputs: &HashMap<TxoRef, Arc<EraCbor>>,
 ) {
+    let mut output_cache: HashMap<TxoRef, Option<u5c::cardano::TxOutput>> = HashMap::new();
+
     for input in tx.inputs.iter_mut() {
         let hash: [u8; 32] = match input.tx_hash.as_ref().try_into() {
             Ok(x) => x,
@@ -172,7 +177,82 @@ fn fill_input_as_output<D: Domain + LedgerContext>(
 
         let txo_ref = TxoRef(TxHash::from(hash), input.output_index as TxoIdx);
 
-        if let Some(era_cbor) = wal_inputs.get(&txo_ref) {
+        if let Some(cached) = output_cache.get(&txo_ref) {
+            input.as_output = cached.clone();
+            continue;
+        }
+
+        let resolved = wal_inputs
+            .get(&txo_ref)
+            .and_then(|era_cbor| MultiEraOutput::try_from(era_cbor.as_ref()).ok())
+            .map(|output| mapper.map_tx_output(&output, None))
+            .or_else(|| archive_output_for_input(domain, mapper, &txo_ref));
+
+        input.as_output = resolved.clone();
+        output_cache.insert(txo_ref, resolved);
+    }
+}
+
+// Resolves a TxoRef via the tx-hash index → archive block → tx outputs.
+// Returns None on any missing step so the stream falls back to `as_output: None`
+// rather than erroring.
+fn archive_output_for_input<D: Domain + LedgerContext>(
+    domain: &D,
+    mapper: &interop::Mapper<D>,
+    txo_ref: &TxoRef,
+) -> Option<u5c::cardano::TxOutput> {
+    let slot = domain
+        .indexes()
+        .slot_by_tx_hash(txo_ref.0.as_slice())
+        .ok()
+        .flatten()?;
+
+    let raw = domain.archive().get_block_by_slot(&slot).ok().flatten()?;
+    let block = MultiEraBlock::decode(raw.as_slice()).ok()?;
+    let txs = block.txs();
+    let tx = txs
+        .iter()
+        .find(|tx| tx.hash().as_slice() == txo_ref.0.as_slice())?;
+    let outputs = tx.outputs();
+    let output = outputs.get(txo_ref.1 as usize)?;
+
+    Some(mapper.map_tx_output(output, None))
+}
+
+// Hydrates each reference input's `as_output` field from the state store.
+// Reference inputs are not consumed, so they are not in the WAL LogValue —
+// but they must still exist in the live UTxO set at the time the tx was
+// applied, so `state().get_utxos` is the right source.
+fn fill_ref_input_as_output<D: Domain + LedgerContext>(
+    tx: &mut u5c::cardano::Tx,
+    mapper: &interop::Mapper<D>,
+    domain: &D,
+) {
+    let refs: Vec<TxoRef> = tx
+        .reference_inputs
+        .iter()
+        .filter_map(|input| {
+            let hash: [u8; 32] = input.tx_hash.as_ref().try_into().ok()?;
+            Some(TxoRef(TxHash::from(hash), input.output_index as TxoIdx))
+        })
+        .collect();
+
+    if refs.is_empty() {
+        return;
+    }
+
+    let utxos = match domain.state().get_utxos(refs) {
+        Ok(u) => u,
+        Err(_) => return,
+    };
+
+    for input in tx.reference_inputs.iter_mut() {
+        let hash: [u8; 32] = match input.tx_hash.as_ref().try_into() {
+            Ok(x) => x,
+            Err(_) => continue,
+        };
+        let txo_ref = TxoRef(TxHash::from(hash), input.output_index as TxoIdx);
+        if let Some(era_cbor) = utxos.get(&txo_ref) {
             if let Ok(output) = MultiEraOutput::try_from(era_cbor.as_ref()) {
                 input.as_output = Some(mapper.map_tx_output(&output, None));
             }
@@ -184,6 +264,7 @@ fn block_to_txs<C: LedgerContext + Domain>(
     block: &RawBlock,
     mapper: &interop::Mapper<C>,
     request: &u5c::watch::WatchTxRequest,
+    domain: &C,
     // Pre-resolved inputs from the WAL LogValue for this block.
     wal_inputs: &HashMap<TxoRef, Arc<EraCbor>>,
 ) -> Vec<u5c::watch::AnyChainTx> {
@@ -202,7 +283,8 @@ fn block_to_txs<C: LedgerContext + Domain>(
                 .is_none_or(|predicate| apply_predicate(predicate, tx))
         })
         .map(|mut tx| {
-            fill_input_as_output(&mut tx, mapper, wal_inputs);
+            fill_input_as_output(&mut tx, mapper, domain, wal_inputs);
+            fill_ref_input_as_output(&mut tx, mapper, domain);
             tx
         })
         .map(|x| u5c::watch::AnyChainTx {
@@ -249,7 +331,7 @@ fn roll_to_watch_response<C: LedgerContext + Domain>(
     let txs: Vec<_> = match log {
         TipEvent::Apply(point, block) => {
             let wal_inputs = wal_inputs_for(domain, point);
-            block_to_txs(block, mapper, request, &wal_inputs)
+            block_to_txs(block, mapper, request, domain, &wal_inputs)
                 .into_iter()
                 .map(u5c::watch::watch_tx_response::Action::Apply)
                 .map(|x| u5c::watch::WatchTxResponse { action: Some(x) })
@@ -257,7 +339,7 @@ fn roll_to_watch_response<C: LedgerContext + Domain>(
         }
         TipEvent::Undo(point, block) => {
             let wal_inputs = wal_inputs_for(domain, point);
-            block_to_txs(block, mapper, request, &wal_inputs)
+            block_to_txs(block, mapper, request, domain, &wal_inputs)
                 .into_iter()
                 .map(u5c::watch::watch_tx_response::Action::Undo)
                 .map(|x| u5c::watch::WatchTxResponse { action: Some(x) })
