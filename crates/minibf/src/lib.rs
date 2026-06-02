@@ -284,7 +284,7 @@ impl<D: Domain> Facade<D> {
 
 pub struct Driver;
 
-pub fn build_router<D>(cfg: MinibfConfig, domain: D) -> Router
+pub fn build_router<D>(cfg: MinibfConfig, domain: D) -> Result<Router, ServeError>
 where
     D: Domain + SubmitExt + Clone + Send + Sync + 'static,
     Option<AccountState>: From<D::Entity>,
@@ -293,11 +293,26 @@ where
     Option<EpochState>: From<D::Entity>,
     Option<DRepState>: From<D::Entity>,
 {
-    build_router_with_facade(Facade::<D> {
+    if let Some(ref base_path) = cfg.base_path {
+        if base_path.is_empty() || base_path == "/" || !base_path.starts_with('/') || base_path.contains('*') {
+            return Err(ServeError::ConfigError(format!(
+                "base_path must start with '/', must not be just '/', and must not contain wildcards; got: \"{}\"",
+                base_path
+            )));
+        }
+    }
+
+    let router = build_router_with_facade(Facade::<D> {
         inner: domain,
-        config: cfg,
+        config: cfg.clone(),
         cache: cache::CacheService::default(),
-    })
+    });
+
+    if let Some(ref base_path) = cfg.base_path {
+        Ok(Router::new().nest(base_path, router))
+    } else {
+        Ok(router)
+    }
 }
 
 pub(crate) fn build_router_with_facade<D>(facade: Facade<D>) -> Router
@@ -310,7 +325,7 @@ where
     Option<DRepState>: From<D::Entity>,
 {
     let permissive_cors = facade.config.permissive_cors();
-    let app = Router::new()
+    Router::new()
         .route("/", get(routes::root::<D>))
         .route("/health", get(routes::health::naked))
         .route("/metrics", get(routes::metrics::metrics::<D>))
@@ -521,8 +536,8 @@ where
             CorsLayer::permissive()
         } else {
             CorsLayer::new()
-        });
-    app.layer(NormalizePathLayer::trim_trailing_slash())
+        })
+        .layer(NormalizePathLayer::trim_trailing_slash())
 }
 
 impl<D: Domain + SubmitExt, C: CancelToken> dolos_core::Driver<D, C> for Driver
@@ -537,7 +552,7 @@ where
     type Config = MinibfConfig;
 
     async fn run(cfg: Self::Config, domain: D, cancel: C) -> Result<(), ServeError> {
-        let app = build_router(cfg.clone(), domain);
+        let app = build_router(cfg.clone(), domain)?;
 
         let listener = tokio::net::TcpListener::bind(cfg.listen_address)
             .await
